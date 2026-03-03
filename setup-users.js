@@ -8,7 +8,7 @@ async function setup() {
     port: process.env.DB_PORT || 3306,
     user: process.env.DB_USER || 'root',
     password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'high',
+    database: process.env.DB_NAME || '',
   });
 
   try {
@@ -75,3 +75,4 @@ async function setup() {
 }
 
 setup();
+
