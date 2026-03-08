@@ -678,7 +678,8 @@ app.get('/api/players/:id', authMiddleware, async (req, res) => {
       [casinoRows],
       [permRows],
       [tempRows],
-      [homes]
+      [homes],
+      [tempVehicleRows]
     ] = await Promise.all([
       pool.query('SELECT * FROM vrp_users WHERE id = ?', [id]),
       pool.query('SELECT * FROM vrp_vehicles WHERE user_id = ?', [id]),
@@ -687,7 +688,8 @@ app.get('/api/players/:id', authMiddleware, async (req, res) => {
       pool.query('SELECT * FROM smartphone_casino WHERE user_id = ?', [id]),
       pool.query('SELECT permiss FROM vrp_permissions WHERE user_id = ?', [id]),
       pool.query('SELECT grupo, data_expiracao FROM grupos_temporarios WHERE user_id = ?', [id]),
-      pool.query('SELECT * FROM vrp_homes WHERE user_id = ?', [id])
+      pool.query('SELECT * FROM vrp_homes WHERE user_id = ?', [id]),
+      pool.query('SELECT vehicle_id, data_expiracao FROM veiculos_temporarios WHERE user_id = ?', [id])
     ]);
     
     if (players.length === 0) {
@@ -719,9 +721,11 @@ app.get('/api/players/:id', authMiddleware, async (req, res) => {
       const trunkKey = `chest:${id}:${(vehicle.vehicle || '').toLowerCase()}`;
       const [trunkRows] = await pool.query('SELECT dvalue FROM vrp_srv_data WHERE dkey = ?', [trunkKey]);
       const trunkData = safeJsonParse(trunkRows[0]?.dvalue, {});
+      const tempVehicle = tempVehicleRows.find(tv => tv.vehicle_id === vehicle.id);
       return {
         ...vehicle,
-        trunkItems: normalizeNamedInventory(trunkData)
+        trunkItems: normalizeNamedInventory(trunkData),
+        data_expiracao: tempVehicle ? tempVehicle.data_expiracao : null
       };
     });
 
@@ -1050,7 +1054,7 @@ app.post('/api/players/:id/groups', authMiddleware, async (req, res) => {
     await pool.query('INSERT INTO vrp_permissions (user_id, permiss) VALUES (?, ?)', [id, permiss]);
 
     if (dias && parseInt(dias) > 0) {
-      const dataExpiracao = new Date(Date.now() + parseInt(dias) * 24 * 60 * 60 * 1000);
+      const dataExpiracao = new Date(Date.now() + parseInt(dias) * 24 * 60 * 60 * 1000 - 3 * 60 * 60 * 1000);
       const dataStr = dataExpiracao.toISOString().slice(0, 19).replace('T', ' ');
       await pool.query('DELETE FROM grupos_temporarios WHERE user_id = ? AND grupo = ?', [id, permiss]);
       await pool.query('INSERT INTO grupos_temporarios (user_id, grupo, data_expiracao) VALUES (?, ?, ?)', [id, permiss, dataStr]);
@@ -1088,7 +1092,7 @@ app.delete('/api/players/:id/groups/:group', authMiddleware, async (req, res) =>
 app.post('/api/players/:id/vehicles', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    const { vehicle, plate } = req.body;
+    const { vehicle, plate, dias } = req.body;
 
     if (!vehicle) {
       return res.status(400).json({ error: 'Modelo do veículo é obrigatório' });
@@ -1105,8 +1109,17 @@ app.post('/api/players/:id/vehicles', authMiddleware, async (req, res) => {
       [id, vehicle, finalPlate]
     );
 
+    if (dias && parseInt(dias) > 0) {
+      const dataExpiracao = new Date(Date.now() + parseInt(dias) * 24 * 60 * 60 * 1000 - 3 * 60 * 60 * 1000);
+      const dataStr = dataExpiracao.toISOString().slice(0, 19).replace('T', ' ');
+      await pool.query('INSERT INTO veiculos_temporarios (user_id, vehicle_id, data_expiracao) VALUES (?, ?, ?)', [id, result.insertId, dataStr]);
+    }
+
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-    await logAction(req.user.id, req.user.username, 'ADD_VEHICLE', `Adicionou veículo ${vehicle} (${finalPlate}) para jogador ID ${id}`, 'vehicle', result.insertId.toString(), ip);
+    const logMsg = dias && parseInt(dias) > 0
+      ? `Adicionou veículo temporário ${vehicle} (${finalPlate}) por ${dias} dias para jogador ID ${id}`
+      : `Adicionou veículo ${vehicle} (${finalPlate}) para jogador ID ${id}`;
+    await logAction(req.user.id, req.user.username, 'ADD_VEHICLE', logMsg, 'vehicle', result.insertId.toString(), ip);
 
     res.json({ success: true, message: 'Veículo adicionado com sucesso', id: result.insertId });
   } catch (error) {
@@ -1125,6 +1138,7 @@ app.delete('/api/players/:id/vehicles/:vehicleId', authMiddleware, async (req, r
     }
 
     await pool.query('DELETE FROM vrp_vehicles WHERE id = ?', [vehicleId]);
+    await pool.query('DELETE FROM veiculos_temporarios WHERE vehicle_id = ?', [vehicleId]);
 
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
     await logAction(req.user.id, req.user.username, 'DELETE_VEHICLE', `Removeu veículo ${vehicle[0].vehicle} (${vehicle[0].plate}) do jogador ID ${id}`, 'vehicle', vehicleId, ip);
@@ -2071,6 +2085,60 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ Promise não tratada:', reason);
 });
+
+// Criar tabela de veículos temporários se não existir
+pool.query(`CREATE TABLE IF NOT EXISTS veiculos_temporarios (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  vehicle_id INT NOT NULL,
+  data_expiracao DATETIME NOT NULL,
+  INDEX idx_user_id (user_id),
+  INDEX idx_vehicle_id (vehicle_id)
+)`).catch(err => console.error('Erro ao criar tabela veiculos_temporarios:', err));
+
+// Job: remover veículos temporários vencidos a cada 10 minutos
+async function removerVeiculosVencidos() {
+  try {
+    const [vencidos] = await pool.query(
+      'SELECT vehicle_id FROM veiculos_temporarios WHERE data_expiracao <= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 3 HOUR)'
+    );
+    if (vencidos.length > 0) {
+      for (const row of vencidos) {
+        await pool.query('DELETE FROM vrp_vehicles WHERE id = ?', [row.vehicle_id]);
+        await pool.query('DELETE FROM veiculos_temporarios WHERE vehicle_id = ?', [row.vehicle_id]);
+      }
+      console.log(`[Veículos Temporários] ${vencidos.length} veículo(s) removido(s) por vencimento.`);
+    }
+  } catch (err) {
+    console.error('[Veículos Temporários] Erro ao remover vencidos:', err);
+  }
+}
+removerVeiculosVencidos();
+setInterval(removerVeiculosVencidos, 10 * 60 * 1000);
+
+// Job: remover cargos temporários vencidos a cada 10 minutos
+async function removerCargosVencidos() {
+  try {
+    const [[{ utcNow }]] = await pool.query('SELECT DATE_SUB(UTC_TIMESTAMP(), INTERVAL 3 HOUR) as utcNow');
+    const [vencidos] = await pool.query(
+      'SELECT user_id, grupo, data_expiracao FROM grupos_temporarios WHERE data_expiracao <= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 3 HOUR)'
+    );
+    console.log(`[Cargos Temporários] BRT agora: ${utcNow} | Vencidos encontrados: ${vencidos.length}`);
+    if (vencidos.length > 0) {
+      for (const row of vencidos) {
+        console.log(`[Cargos Temporários] Removendo user_id=${row.user_id} grupo="${row.grupo}" expirado em ${row.data_expiracao}`);
+        const [r1] = await pool.query('DELETE FROM vrp_permissions WHERE user_id = ? AND permiss = ?', [row.user_id, row.grupo]);
+        const [r2] = await pool.query('DELETE FROM grupos_temporarios WHERE user_id = ? AND grupo = ?', [row.user_id, row.grupo]);
+        console.log(`[Cargos Temporários] vrp_permissions deletados: ${r1.affectedRows} | grupos_temporarios deletados: ${r2.affectedRows}`);
+      }
+      console.log(`[Cargos Temporários] ${vencidos.length} cargo(s) removido(s) por vencimento.`);
+    }
+  } catch (err) {
+    console.error('[Cargos Temporários] Erro ao remover vencidos:', err);
+  }
+}
+removerCargosVencidos();
+setInterval(removerCargosVencidos, 10 * 60 * 1000);
 
 app.listen(PORT, () => {
   console.log(`\n🚀 Servidor rodando na porta ${PORT}`);
