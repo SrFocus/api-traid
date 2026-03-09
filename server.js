@@ -717,8 +717,6 @@ app.get('/api/players/:id', authMiddleware, async (req, res) => {
       };
     });
 
-    console.log(`[DEBUG] Veículos temporários encontrados para user_id=${id}:`, JSON.stringify(tempVehicleRows));
-
     const vehiclePromises = vehiclesData.map(async (vehicle) => {
       const trunkKey = `chest:${id}:${(vehicle.vehicle || '').toLowerCase()}`;
       const [trunkRows] = await pool.query('SELECT dvalue FROM vrp_srv_data WHERE dkey = ?', [trunkKey]);
@@ -726,7 +724,6 @@ app.get('/api/players/:id', authMiddleware, async (req, res) => {
       const tempVehicle = tempVehicleRows.find(tv =>
         (tv.vehicle_id || '').toLowerCase() === (vehicle.vehicle || '').toLowerCase()
       );
-      console.log(`[DEBUG] Veículo: ${vehicle.vehicle} | temp: ${tempVehicle ? tempVehicle.vehicle_id : 'nenhum'}`);
       return {
         ...vehicle,
         trunkItems: normalizeNamedInventory(trunkData),
