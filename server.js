@@ -721,10 +721,11 @@ app.get('/api/players/:id', authMiddleware, async (req, res) => {
       const trunkKey = `chest:${id}:${(vehicle.vehicle || '').toLowerCase()}`;
       const [trunkRows] = await pool.query('SELECT dvalue FROM vrp_srv_data WHERE dkey = ?', [trunkKey]);
       const trunkData = safeJsonParse(trunkRows[0]?.dvalue, {});
-      const tempVehicle = tempVehicleRows.find(tv => tv.vehicle_id === vehicle.id);
+      const tempVehicle = tempVehicleRows.find(tv => tv.vehicle_id === vehicle.vehicle);
       return {
         ...vehicle,
         trunkItems: normalizeNamedInventory(trunkData),
+        temporario: tempVehicle ? true : false,
         data_expiracao: tempVehicle ? tempVehicle.data_expiracao : null
       };
     });
