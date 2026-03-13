@@ -215,7 +215,7 @@ const pool = mysql.createPool({
 // Teste de conexão com o banco
 pool.getConnection()
   .then(conn => {
-    console.log('✅ Conexão com banco de dados estabelecida');
+    // console.log('✅ Conexão com banco de dados estabelecida');
     conn.release();
   })
   .catch(err => {
@@ -618,6 +618,24 @@ app.get('/api/stats', authMiddleware, async (req, res) => {
 
 // ==================== ROTAS DE JOGADORES ====================
 
+// Endpoint para verificar jogadores online (usando tabela vrp_players do vRP)
+app.get('/api/players/online', authMiddleware, async (req, res) => {
+  try {
+    // A tabela vrp_players contém apenas jogadores conectados no momento
+    // Quando um jogador desconecta, seu registro é removido automaticamente pelo servidor FiveM
+    const [onlinePlayers] = await pool.query('SELECT user_id FROM vrp_players');
+    
+    // Retorna array com IDs dos jogadores online
+    const onlineIds = onlinePlayers.map(p => p.user_id);
+    
+    res.json({ onlineIds });
+  } catch (error) {
+    // Se a tabela não existir ou houver erro, retorna array vazio
+    console.error('Erro ao buscar jogadores online:', error.message);
+    res.json({ onlineIds: [] });
+  }
+});
+
 app.get('/api/players', authMiddleware, async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
@@ -721,13 +739,10 @@ app.get('/api/players/:id', authMiddleware, async (req, res) => {
       const trunkKey = `chest:${id}:${(vehicle.vehicle || '').toLowerCase()}`;
       const [trunkRows] = await pool.query('SELECT dvalue FROM vrp_srv_data WHERE dkey = ?', [trunkKey]);
       const trunkData = safeJsonParse(trunkRows[0]?.dvalue, {});
-      const tempVehicle = tempVehicleRows.find(tv =>
-        (tv.vehicle_id || '').toLowerCase() === (vehicle.vehicle || '').toLowerCase()
-      );
+      const tempVehicle = tempVehicleRows.find(tv => tv.vehicle_id === vehicle.id);
       return {
         ...vehicle,
         trunkItems: normalizeNamedInventory(trunkData),
-        temporario: tempVehicle ? true : false,
         data_expiracao: tempVehicle ? tempVehicle.data_expiracao : null
       };
     });
@@ -2065,10 +2080,10 @@ app.use((err, req, res, next) => {
 
 // Tratamento de sinais de encerramento
 const gracefulShutdown = async (signal) => {
-  console.log(`\n${signal} recebido. Encerrando graciosamente...`);
+  // console.log(`\n${signal} recebido. Encerrando graciosamente...`);
   try {
     await pool.end();
-    console.log('✅ Conexões com banco encerradas');
+    // console.log('✅ Conexões com banco encerradas');
     process.exit(0);
   } catch (err) {
     console.error('Erro ao encerrar:', err);
@@ -2110,7 +2125,7 @@ async function removerVeiculosVencidos() {
         await pool.query('DELETE FROM vrp_vehicles WHERE id = ?', [row.vehicle_id]);
         await pool.query('DELETE FROM veiculos_temporarios WHERE vehicle_id = ?', [row.vehicle_id]);
       }
-      console.log(`[Veículos Temporários] ${vencidos.length} veículo(s) removido(s) por vencimento.`);
+      // console.log(`[Veículos Temporários] ${vencidos.length} veículo(s) removido(s) por vencimento.`);
     }
   } catch (err) {
     console.error('[Veículos Temporários] Erro ao remover vencidos:', err);
@@ -2126,18 +2141,18 @@ async function removerCargosVencidos() {
     const [vencidos] = await pool.query(
       'SELECT user_id, grupo, data_expiracao FROM grupos_temporarios WHERE data_expiracao <= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 3 HOUR)'
     );
-    console.log(`[Cargos Temporários] BRT agora: ${utcNow} | Vencidos encontrados: ${vencidos.length}`);
+    // console.log(`[Cargos Temporários] BRT agora: ${utcNow} | Vencidos encontrados: ${vencidos.length}`);
     if (vencidos.length > 0) {
       for (const row of vencidos) {
-        console.log(`[Cargos Temporários] Removendo user_id=${row.user_id} grupo="${row.grupo}" expirado em ${row.data_expiracao}`);
+        // console.log(`[Cargos Temporários] Removendo user_id=${row.user_id} grupo="${row.grupo}" expirado em ${row.data_expiracao}`);
         const [r1] = await pool.query('DELETE FROM vrp_permissions WHERE user_id = ? AND permiss = ?', [row.user_id, row.grupo]);
         const [r2] = await pool.query('DELETE FROM grupos_temporarios WHERE user_id = ? AND grupo = ?', [row.user_id, row.grupo]);
-        console.log(`[Cargos Temporários] vrp_permissions deletados: ${r1.affectedRows} | grupos_temporarios deletados: ${r2.affectedRows}`);
+        // console.log(`[Cargos Temporários] vrp_permissions deletados: ${r1.affectedRows} | grupos_temporarios deletados: ${r2.affectedRows}`);
       }
-      console.log(`[Cargos Temporários] ${vencidos.length} cargo(s) removido(s) por vencimento.`);
+      // console.log(`[Cargos Temporários] ${vencidos.length} cargo(s) removido(s) por vencimento.`);
     }
   } catch (err) {
-    console.error('[Cargos Temporários] Erro ao remover vencidos:', err);
+    // console.error('[Cargos Temporários] Erro ao remover vencidos:', err);
   }
 }
 removerCargosVencidos();
