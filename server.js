@@ -9,6 +9,8 @@ const rateLimit = require('express-rate-limit');
 const { body, param, query, validationResult } = require('express-validator');
 const hpp = require('hpp');
 const compression = require('compression');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -215,7 +217,7 @@ const pool = mysql.createPool({
 // Teste de conexão com o banco
 pool.getConnection()
   .then(conn => {
-    // console.log('✅ Conexão com banco de dados estabelecida');
+    console.log('✅ Conexão com banco de dados estabelecida');
     conn.release();
   })
   .catch(err => {
@@ -335,6 +337,59 @@ const normalizeNamedInventory = (obj) => {
     .filter(([, v]) => v && parseInt(v.amount) > 0)
     .map(([name, v]) => ({ slot: name, item: name, amount: parseInt(v.amount) || 0 }))
     .sort((a, b) => a.item.localeCompare(b.item));
+};
+
+const skinConfigPath = process.env.SKINWEAPONS_CONFIG_PATH
+  ? path.resolve(process.env.SKINWEAPONS_CONFIG_PATH)
+  : path.resolve(__dirname, '../../skinweapons/config/config.lua');
+
+let cachedSkinNames = null;
+
+const loadSkinNamesMap = () => {
+  if (cachedSkinNames) return cachedSkinNames;
+
+  const namesMap = {};
+  try {
+    const content = fs.readFileSync(skinConfigPath, 'utf8');
+    const regex = /\["([A-Z0-9_]+)"\]\s*=\s*\{\s*"([^"]+)"/g;
+    let match;
+    while ((match = regex.exec(content)) !== null) {
+      const component = match[1];
+      const name = match[2];
+      namesMap[component] = name;
+    }
+  } catch (error) {
+    console.warn('Nao foi possivel carregar skinweapons config.lua para nomes de skins:', error.message);
+  }
+
+  cachedSkinNames = namesMap;
+  return namesMap;
+};
+
+const getWeaponSkinName = (component) => {
+  const namesMap = loadSkinNamesMap();
+  return namesMap[component] || component;
+};
+
+const parseWeaponSkinsMap = (value) => {
+  const parsed = safeJsonParse(value, {});
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  return parsed;
+};
+
+const normalizeWeaponSkins = (skinsMap, equippedMap) => {
+  const equippedValues = new Set(
+    Object.values(equippedMap || {}).filter((value) => typeof value === 'string' && value.length > 0)
+  );
+
+  return Object.entries(skinsMap || {})
+    .filter(([, owns]) => !!owns)
+    .map(([component]) => ({
+      name: getWeaponSkinName(component),
+      component,
+      equipped: equippedValues.has(component)
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
 };
 
 const getContainerFromState = (stateObj) => {
@@ -697,7 +752,9 @@ app.get('/api/players/:id', authMiddleware, async (req, res) => {
       [permRows],
       [tempRows],
       [homes],
-      [tempVehicleRows]
+      [tempVehicleRows],
+      [weaponSkinRows],
+      [weaponSkinStockRows]
     ] = await Promise.all([
       pool.query('SELECT * FROM vrp_users WHERE id = ?', [id]),
       pool.query('SELECT * FROM vrp_vehicles WHERE user_id = ?', [id]),
@@ -707,7 +764,9 @@ app.get('/api/players/:id', authMiddleware, async (req, res) => {
       pool.query('SELECT permiss FROM vrp_permissions WHERE user_id = ?', [id]),
       pool.query('SELECT grupo, data_expiracao FROM grupos_temporarios WHERE user_id = ?', [id]),
       pool.query('SELECT * FROM vrp_homes WHERE user_id = ?', [id]),
-      pool.query('SELECT vehicle_id, data_expiracao FROM veiculos_temporarios WHERE user_id = ?', [id])
+      pool.query('SELECT vehicle_id, data_expiracao FROM veiculos_temporarios WHERE user_id = ?', [id]),
+      pool.query('SELECT skins, equipadas FROM waepon_skins_users WHERE user_id = ? LIMIT 1', [id]),
+      pool.query('SELECT component, stock FROM waepon_skins ORDER BY component ASC')
     ]);
     
     if (players.length === 0) {
@@ -775,6 +834,14 @@ app.get('/api/players/:id', authMiddleware, async (req, res) => {
     const casino = casinoRows[0] || null;
     const permissions = permRows.map(r => r.permiss);
     const tempGroups = tempRows.map(r => ({ grupo: r.grupo, data_expiracao: r.data_expiracao }));
+    const skinRow = weaponSkinRows[0] || null;
+    const weaponSkinsMap = parseWeaponSkinsMap(skinRow?.skins);
+    const weaponEquippedMap = parseWeaponSkinsMap(skinRow?.equipadas);
+    const weaponSkins = normalizeWeaponSkins(weaponSkinsMap, weaponEquippedMap);
+    const weaponSkinStock = (weaponSkinStockRows || []).map((row) => ({
+      component: row.component,
+      name: getWeaponSkinName(row.component)
+    })).sort((a, b) => a.name.localeCompare(b.name));
 
     res.json({
       player: players[0],
@@ -787,7 +854,9 @@ app.get('/api/players/:id', authMiddleware, async (req, res) => {
       inventory,
       playerStatus,
       isBanned: banStatus.length > 0,
-      banInfo: banStatus[0] || null
+      banInfo: banStatus[0] || null,
+      weaponSkins,
+      weaponSkinStock
     });
   } catch (error) {
     console.error('Erro ao buscar jogador:', error);
@@ -1056,6 +1125,92 @@ app.delete('/api/players/:id/inventory/:slot', authMiddleware, async (req, res) 
     res.status(500).json({ error: 'Erro ao remover item' });
   }
 });
+
+// ==================== ROTAS DE SKINS DE ARMA ====================
+
+app.post('/api/players/:id/weapon-skins',
+  authMiddleware,
+  actionLimiter,
+  param('id').isInt({ min: 1 }).withMessage('ID de jogador inválido'),
+  body('component').isString().isLength({ min: 2, max: 120 }).trim().withMessage('Componente inválido'),
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const component = String(req.body.component || '').trim().toUpperCase();
+
+      const [rows] = await pool.query('SELECT skins FROM waepon_skins_users WHERE user_id = ? LIMIT 1', [id]);
+      const currentSkins = parseWeaponSkinsMap(rows[0]?.skins);
+
+      if (currentSkins[component]) {
+        return res.status(400).json({ error: 'Jogador já possui esta skin' });
+      }
+
+      currentSkins[component] = true;
+
+      if (rows.length > 0) {
+        await pool.query('UPDATE waepon_skins_users SET skins = ? WHERE user_id = ?', [JSON.stringify(currentSkins), id]);
+      } else {
+        await pool.query('INSERT INTO waepon_skins_users (user_id, skins, equipadas) VALUES (?, ?, ?)', [id, JSON.stringify(currentSkins), JSON.stringify({})]);
+      }
+
+      const ip = getClientIp(req);
+      await logAction(req.user.id, req.user.username, 'ADD_WEAPON_SKIN', `Adicionou skin ${component} para jogador ID ${id}`, 'player', id, ip);
+
+      return res.json({ success: true, message: 'Skin adicionada com sucesso' });
+    } catch (error) {
+      console.error('Erro ao adicionar skin de arma:', error);
+      return res.status(500).json({ error: 'Erro ao adicionar skin de arma' });
+    }
+  }
+);
+
+app.delete('/api/players/:id/weapon-skins/:component',
+  authMiddleware,
+  actionLimiter,
+  param('id').isInt({ min: 1 }).withMessage('ID de jogador inválido'),
+  param('component').isString().isLength({ min: 2, max: 120 }).trim().withMessage('Componente inválido'),
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const component = String(req.params.component || '').trim().toUpperCase();
+
+      const [rows] = await pool.query('SELECT skins, equipadas FROM waepon_skins_users WHERE user_id = ? LIMIT 1', [id]);
+      if (rows.length === 0) {
+        return res.status(404).json({ error: 'Jogador não possui skins registradas' });
+      }
+
+      const currentSkins = parseWeaponSkinsMap(rows[0].skins);
+      if (!currentSkins[component]) {
+        return res.status(404).json({ error: 'Skin não encontrada para este jogador' });
+      }
+
+      delete currentSkins[component];
+
+      const equippedMap = parseWeaponSkinsMap(rows[0].equipadas);
+      for (const weaponName of Object.keys(equippedMap)) {
+        if (equippedMap[weaponName] === component) {
+          delete equippedMap[weaponName];
+        }
+      }
+
+      await pool.query('UPDATE waepon_skins_users SET skins = ?, equipadas = ? WHERE user_id = ?', [
+        JSON.stringify(currentSkins),
+        JSON.stringify(equippedMap),
+        id
+      ]);
+
+      const ip = getClientIp(req);
+      await logAction(req.user.id, req.user.username, 'REMOVE_WEAPON_SKIN', `Removeu skin ${component} do jogador ID ${id}`, 'player', id, ip);
+
+      return res.json({ success: true, message: 'Skin removida com sucesso' });
+    } catch (error) {
+      console.error('Erro ao remover skin de arma:', error);
+      return res.status(500).json({ error: 'Erro ao remover skin de arma' });
+    }
+  }
+);
 
 // ==================== ROTAS DE PERMISSÕES (GRUPOS vRP) ====================
 
@@ -2080,10 +2235,10 @@ app.use((err, req, res, next) => {
 
 // Tratamento de sinais de encerramento
 const gracefulShutdown = async (signal) => {
-  // console.log(`\n${signal} recebido. Encerrando graciosamente...`);
+  console.log(`\n${signal} recebido. Encerrando graciosamente...`);
   try {
     await pool.end();
-    // console.log('✅ Conexões com banco encerradas');
+    console.log('✅ Conexões com banco encerradas');
     process.exit(0);
   } catch (err) {
     console.error('Erro ao encerrar:', err);
@@ -2125,7 +2280,7 @@ async function removerVeiculosVencidos() {
         await pool.query('DELETE FROM vrp_vehicles WHERE id = ?', [row.vehicle_id]);
         await pool.query('DELETE FROM veiculos_temporarios WHERE vehicle_id = ?', [row.vehicle_id]);
       }
-      // console.log(`[Veículos Temporários] ${vencidos.length} veículo(s) removido(s) por vencimento.`);
+      console.log(`[Veículos Temporários] ${vencidos.length} veículo(s) removido(s) por vencimento.`);
     }
   } catch (err) {
     console.error('[Veículos Temporários] Erro ao remover vencidos:', err);
@@ -2141,18 +2296,18 @@ async function removerCargosVencidos() {
     const [vencidos] = await pool.query(
       'SELECT user_id, grupo, data_expiracao FROM grupos_temporarios WHERE data_expiracao <= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 3 HOUR)'
     );
-    // console.log(`[Cargos Temporários] BRT agora: ${utcNow} | Vencidos encontrados: ${vencidos.length}`);
+    console.log(`[Cargos Temporários] BRT agora: ${utcNow} | Vencidos encontrados: ${vencidos.length}`);
     if (vencidos.length > 0) {
       for (const row of vencidos) {
-        // console.log(`[Cargos Temporários] Removendo user_id=${row.user_id} grupo="${row.grupo}" expirado em ${row.data_expiracao}`);
+        console.log(`[Cargos Temporários] Removendo user_id=${row.user_id} grupo="${row.grupo}" expirado em ${row.data_expiracao}`);
         const [r1] = await pool.query('DELETE FROM vrp_permissions WHERE user_id = ? AND permiss = ?', [row.user_id, row.grupo]);
         const [r2] = await pool.query('DELETE FROM grupos_temporarios WHERE user_id = ? AND grupo = ?', [row.user_id, row.grupo]);
-        // console.log(`[Cargos Temporários] vrp_permissions deletados: ${r1.affectedRows} | grupos_temporarios deletados: ${r2.affectedRows}`);
+        console.log(`[Cargos Temporários] vrp_permissions deletados: ${r1.affectedRows} | grupos_temporarios deletados: ${r2.affectedRows}`);
       }
-      // console.log(`[Cargos Temporários] ${vencidos.length} cargo(s) removido(s) por vencimento.`);
+      console.log(`[Cargos Temporários] ${vencidos.length} cargo(s) removido(s) por vencimento.`);
     }
   } catch (err) {
-    // console.error('[Cargos Temporários] Erro ao remover vencidos:', err);
+    console.error('[Cargos Temporários] Erro ao remover vencidos:', err);
   }
 }
 removerCargosVencidos();
